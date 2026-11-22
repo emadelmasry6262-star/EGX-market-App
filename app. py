@@ -1,0 +1,569 @@
+"""
+EGX SMC / Liquidity Reversal Strategy (v20) - Mobile-Friendly Streamlit Dashboard
+Includes:
+  - App Login Gate (Username & Password) + TradingView Credentials
+  - Dedicated Closed Strategy Trades Log Tab (Buy Date/Price, Sell Date/Price, Exit Reason, Net Profit % & EGP, Holding Sessions)
+  - Persistent Virtual Trade Journal (SQLite + CSV Export)
+  - Full v20 Live Radar, Open Positions, Buy-Stop Setups, Watchlist & Backtest Simulation (without Mark-to-Market curve)
+"""
+import os
+import time
+import hashlib
+import sqlite3
+from datetime import datetime
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from tvDatafeed import TvDatafeed, Interval
+
+# ============================ PAGE CONFIG ============================
+st.set_page_config(
+    page_title="EGX SMC Radar v20",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+DB_PATH = "egx_radar_history.db"
+
+# ============================ DATABASE & AUTH ============================
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            tv_user TEXT DEFAULT '',
+            tv_pass TEXT DEFAULT '',
+            initial_cap REAL DEFAULT 100000.0,
+            max_pos INTEGER DEFAULT 5,
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS closed_strategy_trades (
+            trade_key TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            swept_type TEXT,
+            buy_date TEXT NOT NULL,
+            buy_price REAL NOT NULL,
+            sell_date TEXT NOT NULL,
+            sell_price REAL NOT NULL,
+            exit_reason TEXT NOT NULL,
+            net_ret_pct REAL NOT NULL,
+            est_pnl_egp REAL NOT NULL,
+            R_mult REAL NOT NULL,
+            bars_held INTEGER NOT NULL,
+            recorded_at TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            entry_date TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            shares INTEGER NOT NULL,
+            stop_loss REAL NOT NULL,
+            status TEXT DEFAULT 'OPEN',
+            exit_date TEXT,
+            exit_price REAL,
+            pnl_egp REAL DEFAULT 0.0,
+            pnl_pct REAL DEFAULT 0.0,
+            notes TEXT DEFAULT ''
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def hash_pwd(pwd: str) -> str:
+    return hashlib.sha256(pwd.encode("utf-8")).hexdigest()
+
+
+def register_user(username: str, password: str):
+    u = username.strip().lower()
+    if len(u) < 3 or len(password) < 4:
+        return False, "اسم المستخدم يجب أن يكون 3 أحرف على الأقل وكلمة المرور 4 أحرف."
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT username FROM users WHERE username = ?", (u,))
+    if c.fetchone():
+        conn.close()
+        return False, "اسم المستخدم مسجل بالفعل."
+    c.execute(
+        "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+        (u, hash_pwd(password), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+    return True, "تم إنشاء الحساب بنجاح! يمكنك تسجيل الدخول الآن."
+
+
+def verify_user(username: str, password: str):
+    u = username.strip().lower()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT username, password_hash, tv_user, tv_pass, initial_cap, max_pos FROM users WHERE username = ?",
+        (u,)
+    )
+    row = c.fetchone()
+    conn.close()
+    if row and row[1] == hash_pwd(password):
+        return {
+            "username": row[0],
+            "tv_user": row[2] or "",
+            "tv_pass": row[3] or "",
+            "initial_cap": float(row[4] or 100000.0),
+            "max_pos": int(row[5] or 5),
+        }
+    return None
+
+
+def update_user_settings(username: str, tv_user: str, tv_pass: str, initial_cap: float, max_pos: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET tv_user = ?, tv_pass = ?, initial_cap = ?, max_pos = ? WHERE username = ?",
+        (tv_user, tv_pass, initial_cap, max_pos, username)
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_closed_strategy_trades(username: str, closed_df: pd.DataFrame, alloc_per_trade: float):
+    if closed_df is None or closed_df.empty:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for _, r in closed_df.iterrows():
+        b_date = r["entry_date"].strftime("%Y-%m-%d")
+        s_date = r["exit_date"].strftime("%Y-%m-%d")
+        t_key = f"{username}_{r['ticker']}_{b_date}_{s_date}"
+        est_egp = round(alloc_per_trade * (float(r["ret_pct"]) / 100.0), 2)
+        c.execute(
+            """INSERT OR REPLACE INTO closed_strategy_trades
+               (trade_key, username, ticker, swept_type, buy_date, buy_price, sell_date, sell_price,
+                exit_reason, net_ret_pct, est_pnl_egp, R_mult, bars_held, recorded_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                t_key, username, r["ticker"], r["swept"],
+                b_date, float(r["entry"]), s_date, float(r["exit"]),
+                format_exit_reason_ar(r["reason"]), float(r["ret_pct"]),
+                est_egp, float(r["R"]), int(r["bars"]), now_str
+            )
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_closed_strategy_trades(username: str, limit: int = 100) -> pd.DataFrame:
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        """SELECT ticker, swept_type, buy_date, buy_price, sell_date, sell_price,
+                  exit_reason, net_ret_pct, est_pnl_egp, R_mult, bars_held
+           FROM closed_strategy_trades
+           WHERE username = ?
+           ORDER BY sell_date DESC, buy_date DESC
+           LIMIT ?""",
+        conn, params=(username, limit)
+    )
+    conn.close()
+    return df
+
+
+def add_paper_trade(username: str, ticker: str, entry_date: str, entry_price: float, shares: int, stop_loss: float, notes: str = ""):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        """INSERT INTO paper_trades (username, ticker, entry_date, entry_price, shares, stop_loss, status, notes)
+           VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?)""",
+        (username, ticker.upper().strip(), entry_date, entry_price, shares, stop_loss, notes)
+    )
+    conn.commit()
+    conn.close()
+
+
+def close_paper_trade(trade_id: int, exit_date: str, exit_price: float):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT entry_price, shares FROM paper_trades WHERE id = ?", (trade_id,))
+    row = c.fetchone()
+    if row:
+        entry_p, shares = float(row[0]), int(row[1])
+        net_ret = (exit_price / entry_p) - 1.0 - 0.004
+        pnl_egp = round(entry_p * shares * net_ret, 2)
+        pnl_pct = round(net_ret * 100.0, 2)
+        c.execute(
+            """UPDATE paper_trades SET status = 'CLOSED', exit_date = ?, exit_price = ?, pnl_egp = ?, pnl_pct = ?
+               WHERE id = ?""",
+            (exit_date, exit_price, pnl_egp, pnl_pct, trade_id)
+        )
+        conn.commit()
+    conn.close()
+
+
+def update_paper_stop(trade_id: int, new_stop: float):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE paper_trades SET stop_loss = ? WHERE id = ?", (new_stop, trade_id))
+    conn.commit()
+    conn.close()
+
+
+def get_paper_trades(username: str) -> pd.DataFrame:
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT * FROM paper_trades WHERE username = ? ORDER BY id DESC",
+        conn, params=(username,)
+    )
+    conn.close()
+    return df
+
+
+# ============================ STRATEGY CONSTANTS ============================
+DEFAULT_TICKERS = [
+    "COMI", "TMGH", "EAST", "ETEL", "HRHO", "ABUK", "FWRY", "PHDC", "EFIH",
+    "ISPH", "EMFD", "ALCN", "AMOC", "RMDA", "CCAP", "ORAS", "ORHD",
+    "EFID", "BTFH", "JUFO", "GBCO", "RAYA", "SKPC", "CLHO", "VLMR",
+    "HELI", "MFPC", "MCQE", "EGAL", "ADIB", "SWDY", "ORWE",
+    "MASR", "MTIE", "POUL", "CSAG", "ARCC", "BINV"
+]
+
+EXCHANGE = "EGX"
+N_BARS = 1500
+DATA_START = "2022-01-01"
+TEST_START = "2023-01-01"
+
+TREND_EMA = 50
+TREND_SLOPE = 10
+ENTRY_TIMEOUT = 5
+STOP_PCT = 0.05
+MAX_HOLD = 60
+COMMISSION = 0.002
+
+USE_CANDLE_FILTER = True
+SWEEP_CLOSE_POS = 0.50
+USE_EMA200_FILTER = True
+LONG_EMA = 200
+
+USE_SWING_LOWS = True
+SWING_WINDOW = 10
+SWING_MAX_AGE = 250
+
+USE_ORDER_BLOCKS = True
+ALLOW_STANDALONE_OB = False
+ALLOW_MULTI_CONFLUENCE = False
+OB_IMPULSE_PCT = 0.03
+OB_MAX_AGE = 180
+
+DROP_PARTIAL_LAST_BAR = True
+MARKET_TZ = "Africa/Cairo"
+MARKET_CLOSE_HHMM = (15, 0)
+
+
+# ============================ HELPER: TRANSLATE EXIT REASON ============================
+def format_exit_reason_ar(reason: str) -> str:
+    if not reason:
+        return "غير محدد"
+    if reason == "post25_drop":
+        return "🎯 ضرب وقف ملاحقة القيعان بعد تحقيق +25% (حجز أرباح كبرى)"
+    if reason == "stop(0%)":
+        return "🛑 ضرب وقف الخسارة المبدئي (-5%)"
+    if reason == "stop(5%)":
+        return "🛡️ ضرب وقف التعادل (بعد الوصول لربح +5%)"
+    if reason == "stop(7.5%)":
+        return "💰 ضرب الوقف المتحرك عند +5% (بعد الوصول لربح +7.5%)"
+    if reason == "stop(10%)":
+        return "💰 ضرب الوقف المتحرك عند +7.5% (بعد الوصول لربح +10%)"
+    if reason == "stop(15%)":
+        return "💰 ضرب الوقف المتحرك عند +10% (بعد الوصول لربح +15%)"
+    if reason.startswith("time("):
+        tier = reason.replace("time(", "").replace(")", "")
+        return f"⏱️ انتهاء مدة الاحتفاظ القصوى (60 جلسة) — مستوى {tier}"
+    return reason
+
+
+# ============================ STRATEGY ENGINE ============================
+def get_tv_client(tv_user: str, tv_pass: str):
+    u = tv_user.strip() if tv_user else ""
+    p = tv_pass.strip() if tv_pass else ""
+    if u and p:
+        return TvDatafeed(u, p)
+    return TvDatafeed()
+
+
+def clean_df(df):
+    cols = ["open", "high", "low", "close"]
+    if "volume" in df.columns:
+        cols.append("volume")
+    df = df[cols].astype(float).dropna()
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+    return df[~df.index.duplicated(keep="last")].sort_index()
+
+
+def drop_partial_last_bar(df):
+    if not DROP_PARTIAL_LAST_BAR or df is None or df.empty:
+        return df
+    try:
+        from zoneinfo import ZoneInfo
+        now = pd.Timestamp.now(tz=ZoneInfo(MARKET_TZ)).tz_localize(None)
+    except Exception:
+        now = pd.Timestamp.now()
+    today = now.normalize()
+    close_t = today + pd.Timedelta(hours=MARKET_CLOSE_HHMM[0], minutes=MARKET_CLOSE_HHMM[1])
+    if df.index[-1] >= today and now < close_t:
+        df = df.iloc[:-1]
+    return df
+
+
+def download_stock(tv, sym, n_bars=N_BARS):
+    for _ in range(3):
+        try:
+            raw = tv.get_hist(symbol=sym, exchange=EXCHANGE, interval=Interval.in_daily, n_bars=n_bars)
+            if raw is not None and not raw.empty:
+                df = raw.copy()
+                df.columns = [c.lower() for c in df.columns]
+                df.index = pd.DatetimeIndex(df.index).tz_localize(None).normalize()
+                df = drop_partial_last_bar(clean_df(df))
+                return df[df.index >= pd.Timestamp(DATA_START)]
+        except Exception:
+            time.sleep(0.7)
+    return None
+
+
+def prior_downtrend(close):
+    s = pd.Series(close)
+    ema = s.ewm(span=TREND_EMA, adjust=False).mean()
+    down = (s < ema) & (ema < ema.shift(TREND_SLOPE))
+    if USE_EMA200_FILTER:
+        ema200 = s.ewm(span=LONG_EMA, adjust=False).mean()
+        down = down & (s > ema200)
+    return down.shift(1, fill_value=False).values.astype(bool)
+
+
+def current_filter_status(close):
+    s = pd.Series(close)
+    ema = s.ewm(span=TREND_EMA, adjust=False).mean()
+    down = (s < ema) & (ema < ema.shift(TREND_SLOPE))
+    if USE_EMA200_FILTER:
+        ema200 = s.ewm(span=LONG_EMA, adjust=False).mean()
+        down = down & (s > ema200)
+    return bool(down.iloc[-1])
+
+
+def prev_period_lows(df):
+    wk = df.index.to_period("W-THU")
+    mo = df.index.to_period("M")
+    wlow = df["low"].groupby(wk).min()
+    mlow = df["low"].groupby(mo).min()
+    pwl = wlow.shift(1).reindex(wk).values
+    pml = mlow.shift(1).reindex(mo).values
+    return pwl, pml
+
+
+def build_smc_structures(o, h, l, c):
+    L = len(c)
+    swing_pivots = {}
+    if USE_SWING_LOWS:
+        w = SWING_WINDOW
+        for piv in range(w, L - w):
+            window_lows = l[piv - w: piv + w + 1]
+            if l[piv] == np.min(window_lows) and np.sum(window_lows == l[piv]) == 1:
+                swing_pivots[piv + w] = (piv, float(l[piv]))
+
+    order_blocks = {}
+    if USE_ORDER_BLOCKS:
+        for k in range(1, L - 1):
+            if c[k] < o[k] and c[k + 1] > o[k + 1]:
+                impulse = (c[k + 1] - o[k + 1]) / o[k + 1]
+                if impulse >= OB_IMPULSE_PCT and c[k + 1] > h[k]:
+                    order_blocks[k + 1] = (k, float(l[k]), float(h[k]))
+
+    return swing_pivots, order_blocks
+
+
+def last_red_run_high(red, h, i, max_len=30):
+    r = i
+    while r >= 0 and not red[r] and i - r < max_len:
+        r -= 1
+    if r < 0 or not red[r]:
+        return None
+    run_high, k = h[r], r
+    while k - 1 >= 0 and red[k - 1] and r - k < max_len:
+        k -= 1
+        run_high = max(run_high, h[k])
+    return run_high
+
+
+def update_trailing_stop_next_session(pos, bar_high, bar_low):
+    entry = pos["entry"]
+    pos["mfe"] = max(pos["mfe"], bar_high)
+    mfe_pct = (pos["mfe"] / entry) - 1.0
+
+    if mfe_pct >= 0.25:
+        pos["post_25"] = True
+        pos["max_tier"] = "25%+"
+        new_stop = max(entry * 1.15, bar_low)
+        pos["stop"] = max(pos["stop"], new_stop)
+    elif mfe_pct >= 0.15:
+        pos["max_tier"] = "15%"
+        pos["stop"] = max(pos["stop"], entry * 1.10)
+    elif mfe_pct >= 0.10:
+        pos["max_tier"] = "10%"
+        pos["stop"] = max(pos["stop"], entry * 1.075)
+    elif mfe_pct >= 0.075:
+        pos["max_tier"] = "7.5%"
+        pos["stop"] = max(pos["stop"], entry * 1.05)
+    elif mfe_pct >= 0.05:
+        pos["max_tier"] = "5%"
+        pos["stop"] = max(pos["stop"], entry * 1.00)
+
+
+def close_trade(tk, pos, i, ex, reason, dates):
+    ret = ex / pos["entry"] - 1 - 2 * COMMISSION
+    return dict(
+        ticker=tk,
+        entry_date=dates[pos["i0"]],
+        exit_date=dates[i],
+        swept=pos["kind"],
+        entry=round(pos["entry"], 3),
+        final_stop=round(pos["stop"], 3),
+        exit=round(ex, 3),
+        reason=reason,
+        max_tier=pos["max_tier"],
+        ret_pct=round(ret * 100, 2),
+        R=round(ret / pos["risk"], 2),
+        mfe_pct=round((pos["mfe"] / pos["entry"] - 1) * 100, 2),
+        bars=i - pos["i0"],
+        swept_level=round(pos["level"], 3)
+    )
+
+
+def run_stock(tk, df, alloc_per_trade):
+    o, h, l, c = (df[x].values for x in ("open", "high", "low", "close"))
+    dates = df.index
+    L = len(df)
+    red = c < o
+    down = prior_downtrend(c)
+    pwl, pml = prev_period_lows(df)
+    swing_pivots, order_blocks = build_smc_structures(o, h, l, c)
+    start_ts = pd.Timestamp(TEST_START)
+
+    active_swings = []
+    active_obs = []
+    used_wm, state, pos, s, trades = set(), "IDLE", None, {}, []
+
+    for i in range(L):
+        if i in swing_pivots:
+            piv_i, p_val = swing_pivots[i]
+            active_swings.append(dict(piv_i=piv_i, price=p_val, used=False))
+        if i in order_blocks:
+            ob_i, ob_l, ob_h = order_blocks[i]
+            active_obs.append(dict(ob_i=ob_i, low=ob_l, high=ob_h, used=False))
+
+        active_swings = [sw for sw in active_swings if (i - sw["piv_i"] <= SWING_MAX_AGE) and not sw["used"]]
+        active_obs = [ob for ob in active_obs if (i - ob["ob_i"] <= OB_MAX_AGE) and not ob["used"]]
+
+        if pos is not None:
+            if i > pos["i0"]:
+                ex = reason = None
+                if l[i] <= pos["stop"]:
+                    ex = min(o[i], pos["stop"])
+                    reason = "post25_drop" if pos["post_25"] else f"stop({pos['max_tier']})"
+                elif (not pos["post_25"]) and (i - pos["i0"] >= MAX_HOLD):
+                    ex = c[i]
+                    reason = f"time({pos['max_tier']})"
+
+                if ex is not None:
+                    trades.append(close_trade(tk, pos, i, ex, reason, dates))
+                    pos, state = None, "IDLE"
+                else:
+                    update_trailing_stop_next_session(pos, h[i], l[i])
+
+            for sw in active_swings:
+                if c[i] < sw["price"]:
+                    sw["used"] = True
+            for ob in active_obs:
+                if c[i] < ob["low"]:
+                    ob["used"] = True
+            continue
+
+        if state == "WAIT":
+            if i - s["sweep_i"] > ENTRY_TIMEOUT:
+                state = "IDLE"
+            else:
+                trigger = s["run_high"]
+                if h[i] >= trigger:
+                    fill = max(o[i], trigger)
+                    stop = fill * (1 - STOP_PCT)
+                    state = "IDLE"
+                    pos = dict(
+                        i0=i, entry=fill, stop=stop, risk=STOP_PCT, mfe=fill,
+                        level=s["level"], kind=s["kind"],
+                        sweep_low=s["sweep_low"], sweep_i=s["sweep_i"],
+                        max_tier="0%", post_25=False
+                    )
+                    if l[i] <= stop:
+                        trades.append(close_trade(tk, pos, i, stop, "stop(0%)", dates))
+                        pos = None
+                    else:
+                        update_trailing_stop_next_session(pos, h[i], l[i])
+                    continue
+                if c[i] < s["level"]:
+                    state = "IDLE"
+                    continue
+                s["sweep_low"] = min(s["sweep_low"], l[i])
+                if red[i]:
+                    s["run_high"] = max(s["run_high"], h[i]) if s["last_red"] else h[i]
+                s["last_red"] = bool(red[i])
+
+        if state == "IDLE" and dates[i] >= start_ts and down[i]:
+            candle_ok = True
+            if USE_CANDLE_FILTER:
+                rng = h[i] - l[i]
+                if rng <= 0 or (c[i] - l[i]) / rng < SWEEP_CLOSE_POS:
+                    candle_ok = False
+
+            if candle_ok:
+                sweep_hits = []
+                if not np.isnan(pwl[i]) and l[i] < pwl[i] and c[i] > pwl[i]:
+                    if ("week", round(float(pwl[i]), 4)) not in used_wm:
+                        sweep_hits.append(("week", float(pwl[i]), float(pwl[i])))
+
+                if not np.isnan(pml[i]) and l[i] < pml[i] and c[i] > pml[i]:
+                    if ("month", round(float(pml[i]), 4)) not in used_wm:
+                        sweep_hits.append(("month", float(pml[i]), float(pml[i])))
+
+                matched_swings = []
+                for sw in active_swings:
+                    if l[i] < sw["price"] and c[i] > sw["price"]:
+                        sweep_hits.append(("swing_low", sw["price"], sw["price"]))
+                        matched_swings.append(sw)
+
+                ob_hits = []
+                matched_obs = []
+                for ob in active_obs:
+                    if l[i] <= ob["high"] and c[i] > ob["low"] and i > ob["ob_i"] + 2:
+                        ob_hits.append(("order_block", ob["low"], ob["high"]))
+                        matched_obs.append(ob)
+
+                if sweep_hits or (ALLOW_STANDALONE_OB and ob_hits):
+                    hits = sweep_hits + ob_hits
+                    seen_k = []
+                    for k, _, _ in hits:
+                        if k not in seen_k:
+                            seen_k.append(k)
+
+                    if not ALLOW_MULTI_CONFLUENCE and len(seen_k) > 2:
+                        pass
+                    else:
+                        rh = last_red_run_high(red, h, i)
+                        if rh is no

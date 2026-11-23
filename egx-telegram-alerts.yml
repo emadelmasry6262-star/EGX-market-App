@@ -1,0 +1,58 @@
+name: EGX Telegram Live Alerts & Daily Report
+
+on:
+  schedule:
+    # 1) Intraday scan every 15 minutes during EGX trading hours
+    # Cairo Time (UTC+2): 10:00 - 14:45 -> UTC: 08:00 - 12:45 (Sun-Thu)
+    - cron: '*/15 8-12 * * 0-4'
+    # 2) First Daily Report at 15:00 Cairo Time (13:00 UTC) after session close
+    - cron: '0 13 * * 0-4'
+    # 3) Second Daily Report at 22:00 Cairo Time (20:00 UTC) evening recap
+    - cron: '0 20 * * 0-4'
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: 'Run mode (auto, intraday, daily_report)'
+        required: false
+        default: 'auto'
+
+permissions:
+  contents: write
+
+jobs:
+  run-egx-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install numpy pandas git+https://github.com/rongardF/tvdatafeed.git
+
+      - name: Run Telegram Alerts & Daily Report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TV_USER: ${{ secrets.TV_USER }}
+          TV_PASS: ${{ secrets.TV_PASS }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          MODE="${{ github.event.inputs.run_mode }}"
+          if [ -z "$MODE" ]; then MODE="auto"; fi
+          python telegram_alerts.py "$MODE"
+
+      - name: Save alert state to prevent duplicates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f telegram_alert_state.json ]; then
+            git add telegram_alert_state.json
+            git diff --quiet && git diff --staged --quiet || (git commit -m "Update telegram alert state" && git push)
+          fi

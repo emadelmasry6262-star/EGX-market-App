@@ -2,19 +2,23 @@ name: EGX Telegram Live Alerts & Daily Report
 
 on:
   schedule:
-    # 1) Intraday scan every 15 minutes during EGX trading hours
-    # Cairo Time (UTC+2): 10:00 - 14:45 -> UTC: 08:00 - 12:45 (Sun-Thu)
+    # Runs every 15 minutes during EGX trading hours (08:00 - 12:45 UTC = 10:00 - 14:45 Cairo Time, Sun-Thu)
     - cron: '*/15 8-12 * * 0-4'
-    # 2) First Daily Report at 15:00 Cairo Time (13:00 UTC) after session close
+    # Runs at 13:00 UTC (15:00 Cairo Time, Sun-Thu) for Afternoon Daily Report
     - cron: '0 13 * * 0-4'
-    # 3) Second Daily Report at 22:00 Cairo Time (20:00 UTC) evening recap
+    # Runs at 20:00 UTC (22:00 Cairo Time, Sun-Thu) for Evening Daily Report
     - cron: '0 20 * * 0-4'
   workflow_dispatch:
     inputs:
       run_mode:
-        description: 'Run mode (auto, intraday, daily_report)'
-        required: false
-        default: 'auto'
+        description: 'نوع التشغيل اليدوي (manual_intraday = فحص لحظي مع ملخص | daily_report = تقرير يومي | auto = تلقائي)'
+        required: true
+        default: 'manual_intraday'
+        type: choice
+        options:
+          - manual_intraday
+          - daily_report
+          - auto
 
 permissions:
   contents: write
@@ -34,7 +38,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install numpy pandas git+https://github.com/rongardF/tvdatafeed.git
+          pip install numpy pandas matplotlib git+https://github.com/rongardF/tvdatafeed.git
 
       - name: Run Telegram Alerts & Daily Report
         env:
@@ -43,9 +47,13 @@ jobs:
           TV_USER: ${{ secrets.TV_USER }}
           TV_PASS: ${{ secrets.TV_PASS }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
+          INPUT_RUN_MODE: ${{ github.event.inputs.run_mode }}
         run: |
-          MODE="${{ github.event.inputs.run_mode }}"
-          if [ -z "$MODE" ]; then MODE="auto"; fi
+          MODE="${INPUT_RUN_MODE:-auto}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$MODE" = "auto" ]; then
+            MODE="manual_intraday"
+          fi
+          echo "Running mode: $MODE"
           python telegram_alerts.py "$MODE"
 
       - name: Save alert state to prevent duplicates

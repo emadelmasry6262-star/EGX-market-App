@@ -1,0 +1,72 @@
+name: EGX Telegram Live Alerts & Daily Report
+
+on:
+  schedule:
+    # Every 30 min, 07:00-13:30 UTC. This covers 10:00-14:30 and 15:00 Cairo time
+    # in both winter and summer time. The script decides the actual Cairo-time action.
+    - cron: '*/30 7-13 * * 0-4'
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: 'نوع التشغيل اليدوي (manual_intraday للفحص اللحظي، daily_report للتقرير اليومي)'
+        required: false
+        default: 'manual_intraday'
+        type: choice
+        options:
+          - manual_intraday
+          - daily_report
+
+permissions:
+  contents: write
+
+# Prevent two runs from writing the state file at the same time
+concurrency:
+  group: egx-telegram-bot
+  cancel-in-progress: false
+
+jobs:
+  run-egx-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install numpy pandas matplotlib requests websocket-client git+https://github.com/rongardF/tvdatafeed.git
+
+      - name: Run Telegram Alerts & Daily Report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TV_USER: ${{ secrets.TV_USER }}
+          TV_PASS: ${{ secrets.TV_PASS }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          INPUT_RUN_MODE: ${{ github.event.inputs.run_mode }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            MODE="${INPUT_RUN_MODE:-manual_intraday}"
+          else
+            MODE="auto"
+          fi
+          echo "Running mode: $MODE (Event: $GITHUB_EVENT_NAME)"
+          python telegram_alerts.py "$MODE"
+
+      - name: Save alert state to prevent duplicates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -f telegram_alert_state.json ]; then
+            git add telegram_alert_state.json
+            if ! git diff --staged --quiet; then
+              git commit -m "Update telegram alert state"
+              git pull --rebase
+              git push
+            fi
+          fi
